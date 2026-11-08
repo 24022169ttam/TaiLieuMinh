@@ -1,0 +1,1006 @@
+import gc
+gc.collect()
+import config as C
+from machine import Pin, I2C
+from lcd_i2c import LCD
+
+lcd = None
+try:
+    i2c = I2C(0, scl=Pin(C.PIN_SCL), sda=Pin(C.PIN_SDA), freq=100000)
+    found = i2c.scan()
+    addr = C.LCD_ADDR if C.LCD_ADDR in found else (found[0] if found else C.LCD_ADDR)
+    lcd = LCD(i2c, addr)
+except Exception as e:
+    print("Khong tim thay LCD:", e)
+
+
+def lcd_line(row, s):
+    if lcd:
+        try:
+            lcd.line(row, s)
+        except Exception:
+            pass
+
+
+lcd_line(0, "CHONG NGAP HMI")
+lcd_line(1, "Dang khoi dong..")
+
+import net
+net.wifi_setup(lcd_line)
+gc.collect()
+print("RAM trong truoc khi nap chuong trinh:", gc.mem_free())
+
+import state
+gc.collect()
+import hw
+gc.collect()
+import logic
+gc.collect()
+import cmd
+gc.collect()
+import web
+gc.collect()
+import app
+gc.collect()
+app.start(lcd)
+
+#==============================================================================
+# FILE: config.py  –  Cấu hình: Wi-Fi, chân GPIO, ngưỡng
+#==============================================================================
+# config.py - CAU HINH HE THONG CHONG NGAP (MicroPython / ESP32)
+# Chi can sua file nay. main.py doc cac gia tri o day.
+
+# ---------- Wi-Fi co Internet: thu lan luot tu tren xuong (chi bat 2.4 GHz) ----------
+WIFI_LIST = [
+    ("TEN_WIFI_1",   "MAT_KHAU_1"),   # diem phat dien thoai (uu tien)
+    ("TEN_WIFI_2",   "MAT_KHAU_2"),      # Wi-Fi nha (du phong)
+]
+
+# Wi-Fi rieng do ESP32 phat ra (http://192.168.4.1).
+# False = TAT cho nhe bo nho. HMI mo qua IP cua Wi-Fi dang ket noi.
+ENABLE_AP = False
+AP_SSID = "HMI-ChongNgap"
+AP_PASS = "12345678"          # toi thieu 8 ky tu
+HOSTNAME = "chongngap"
+
+# ---------- Chan GPIO (giu nguyen so do di day) ----------
+PIN_TRIG = 5
+PIN_ECHO = 18
+PIN_WATER = 34
+PIN_IR = 19
+PIN_SERVO = 13
+PIN_BUZZER = 12
+PIN_LED_G = 2
+PIN_LED_Y = 4
+PIN_LED_R = 16
+PIN_SW_MODE = 14     # cong tac Auto/Manual
+PIN_BTN_OPEN = 27    # nut Mo cua
+PIN_BTN_CLOSE = 26   # nut Dong cua
+PIN_SDA = 21
+PIN_SCL = 22
+LCD_ADDR = 0x27      # neu LCD khong hien, thu 0x3F (main.py tu do I2C)
+
+SW_MANUAL_LEVEL = 1        # GPIO14 = 1 (ho) la THU CONG, = 0 (noi GND) la TU DONG
+INTERLOCK_MANUAL = True    # chan lenh dong cua khi FC-51 thay xe, ca o thu cong
+MANUAL_ALARMS = True       # o thu cong van bao den/coi. False = tat het nhu code cu
+
+# ---------- Servo MG995 ----------
+SERVO_OPEN = 0             # cua nam phang tren doc ham
+SERVO_CLOSED = 140         # cua dung len chan nuoc
+SERVO_MIN_US = 544         # do rong xung 0 do (giong thu vien ESP32Servo)
+SERVO_MAX_US = 2400        # do rong xung 180 do
+
+# ---------- Nguong mac dinh (chinh lai duoc tren HMI, luu vao settings.json) ----------
+TH_DEEP = 7.0              # khoang cach < 7.0 cm: NGAP SAU
+TH_WARN = 7.5              # 7.0 - 7.5 cm: CANH BAO
+TH_WATER = 2000            # ADC cam bien nuoc >= 2000: NGAP SAU
+TH_WATER_WARN = 500        # ADC >= 500: CANH BAO
+EARLY_SEC = 20             # dong cua som khi du bao con <= 20 s (0 = tat)
+DRY_CM = 12.0              # khoang cach cam bien -> day ranh khi kho
+
+# ---------- Thong so thuat toan ----------
+CAR_STUCK_SEC = 30         # xe dung truoc cua > 30 s khi ngap sau = XE KET
+US_LOST_MS = 3000          # khong co echo > 3 s = mat sieu am
+NOISE_ON_CM = 1.0
+NOISE_OFF_CM = 0.6
+RATE_MIN_CM_MIN = 0.3      # toc do dang toi thieu de tinh du bao
+RATE_WINDOW = 30           # so mau (1 mau/giay) cho hoi quy
+MISMATCH_SEC = 5           # 2 cam bien lech nhau lien tuc 5 s moi bao
+DRY_FLOOR_ADC = 300
+
+#==============================================================================
+# FILE: net.py  –  Kết nối Wi-Fi
+#==============================================================================
+# net.py - ket noi Wi-Fi: thu lan luot cac mang trong config.WIFI_LIST
+import time, network
+import config as C
+
+
+def now():
+    return time.ticks_ms()
+
+
+def since(t):
+    return time.ticks_diff(time.ticks_ms(), t)
+
+
+# =============================== WI-FI (doi tuong) ===============================
+sta = network.WLAN(network.STA_IF)
+ap = network.WLAN(network.AP_IF)
+
+
+# =============================== KET NOI WI-FI ===============================
+wifi_idx = 0
+
+
+def wifi_setup(lcd_line=lambda row, s: None):
+    global wifi_idx
+    try:
+        network.hostname(C.HOSTNAME)
+    except Exception:
+        pass
+    if getattr(C, "ENABLE_AP", False):
+        ap.active(True)
+        try:
+            ap.config(essid=C.AP_SSID, password=C.AP_PASS, authmode=3)   # 3 = WPA2-PSK
+        except Exception:
+            ap.config(essid=C.AP_SSID, password=C.AP_PASS)
+    else:
+        ap.active(False)                       # khong phat Wi-Fi rieng
+    sta.active(True)
+    for i, (ssid, pw) in enumerate(C.WIFI_LIST):
+        wifi_idx = i
+        lcd_line(1, ssid)
+        print("Thu Wi-Fi:", ssid)
+        try:
+            sta.disconnect()
+            t1 = now()
+            while sta.isconnected() and since(t1) < 1500:   # doi ngat han ket noi cu (sau soft reboot)
+                time.sleep_ms(100)
+        except Exception:
+            pass
+        try:
+            sta.connect(ssid, pw)
+        except Exception as e:
+            print("Loi ket noi:", e)
+        t0 = now()
+        while not sta.isconnected() and since(t0) < 8000:
+            time.sleep_ms(200)
+        if sta.isconnected():
+            break
+    if sta.isconnected():
+        ip = sta.ifconfig()[0]
+        try:
+            lcd_line(0, "WiFi:" + sta.config("essid"))
+        except Exception:
+            lcd_line(0, "WiFi:" + C.WIFI_LIST[wifi_idx][0])
+        lcd_line(1, ip)
+        try:
+            real = sta.config("essid")             # ten Wi-Fi thuc su dang ket noi
+        except Exception:
+            real = C.WIFI_LIST[wifi_idx][0]
+        print("Da vao Wi-Fi", real, "- HMI: http://" + ip)
+    elif getattr(C, "ENABLE_AP", False):
+        lcd_line(0, "AP:" + C.AP_SSID)
+        lcd_line(1, ap.ifconfig()[0])
+    else:
+        lcd_line(0, "KHONG CO WIFI")
+        lcd_line(1, "Dang thu lai...")
+        print("Chua vao duoc Wi-Fi nao, se tu thu lai moi 15 s")
+    if getattr(C, "ENABLE_AP", False):
+        print("Wi-Fi rieng:", C.AP_SSID, "- HMI: http://" + ap.ifconfig()[0])
+
+#==============================================================================
+# FILE: state.py  –  Biến trạng thái, nhật ký, lưu flash
+#==============================================================================
+# state.py - trang thai chung, cau hinh luu flash, nhat ky su kien
+import time, json, gc
+import config as C
+
+
+ST_SAFE, ST_WARN, ST_DEEP, ST_RECEDE = 0, 1, 2, 3
+
+
+ST_NAME = ("AN TOÀN", "CẢNH BÁO NGUY CƠ", "NGẬP SÂU", "NƯỚC ĐÃ RÚT")
+
+
+BOOT_ID = time.ticks_ms() & 0xFFFF
+
+
+def now():
+    return time.ticks_ms()
+
+
+def since(t):
+    return time.ticks_diff(time.ticks_ms(), t)
+
+
+cfg = {"deep": C.TH_DEEP, "warn": C.TH_WARN, "water": C.TH_WATER, "wwarn": C.TH_WATER_WARN,
+       "early": C.EARLY_SEC, "dry": C.DRY_CM}
+
+
+stats = {"nf": 0, "fs": 0, "mx": 0.0, "np": 0}
+
+
+def load_json(name, target):
+    try:
+        with open(name) as f:
+            target.update(json.load(f))
+    except Exception:
+        pass
+
+
+def save_json(name, data):
+    try:
+        with open(name, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("Loi ghi", name, e)
+
+
+class R:
+    pass
+
+
+r = R()
+r.dist = -1.0; r.noise = 0.0; r.water = 0; r.car = False
+r.auto = True; r.muted = False; r.latched = False; r.pre = False; r.blocked = False; r.buz = False
+r.state = ST_SAFE; r.tgt = C.SERVO_OPEN; r.pos = C.SERVO_OPEN
+r.last_valid = now(); r.diag = 0; r.misA = 0; r.misB = 0
+r.rate = 0.0; r.eta = -1
+r.car_since = 0; r.car_sec = 0; r.stuck = False
+r.last_flood = 0; r.flood_start = 0
+r.test = -1; r.test_t0 = 0; r.last_test = 0
+r.lcd1 = ""; r.lcd2 = ""
+
+
+
+
+def depth():
+    return max(0.0, cfg["dry"] - r.dist) if r.dist > 0 else 0.0
+
+
+events = []          # (id, noi dung, muc do, thoi diem)
+
+
+ev_id = 0
+
+
+def event(msg, lv=3):
+    # lv: 0 binh thuong, 1 canh bao, 2 bao dong, 3 thong tin
+    global ev_id
+    ev_id += 1
+    events.append((ev_id, msg, lv, now()))
+    if len(events) > 20:
+        events.pop(0)
+    print(msg)
+
+#==============================================================================
+# FILE: hw.py  –  Phần cứng: cảm biến, servo, LED, còi, LCD, nút
+#==============================================================================
+# hw.py - phan cung: cam bien, servo, LED, coi, nut nhan, LCD
+import time
+from machine import Pin, PWM, ADC, time_pulse_us
+import config as C
+from state import *
+
+
+trig = Pin(C.PIN_TRIG, Pin.OUT, value=0)
+
+
+echo = Pin(C.PIN_ECHO, Pin.IN)
+
+
+adc = ADC(Pin(C.PIN_WATER))
+
+
+adc.atten(ADC.ATTN_11DB)                       # do 0 - 3.3 V
+
+
+ir = Pin(C.PIN_IR, Pin.IN, Pin.PULL_UP)
+
+
+buzzer = Pin(C.PIN_BUZZER, Pin.OUT, value=0)
+
+
+led_g = Pin(C.PIN_LED_G, Pin.OUT, value=0)
+
+
+led_y = Pin(C.PIN_LED_Y, Pin.OUT, value=0)
+
+
+led_r = Pin(C.PIN_LED_R, Pin.OUT, value=0)
+
+
+servo = PWM(Pin(C.PIN_SERVO), freq=50)
+
+
+def read_water():
+    try:
+        return adc.read_u16() >> 4             # 0 - 4095 nhu analogRead cua Arduino
+    except AttributeError:
+        return adc.read()
+
+
+def servo_write(deg):
+    us = C.SERVO_MIN_US + (C.SERVO_MAX_US - C.SERVO_MIN_US) * deg // 180
+    try:
+        servo.duty_ns(us * 1000)
+    except AttributeError:
+        servo.duty(us * 1023 // 20000)
+
+
+lcd = None          # duoc main.py truyen vao qua start()
+
+
+def lcd_line(row, s):
+    if lcd:
+        try:
+            lcd.line(row, s)
+        except Exception:
+            pass
+
+
+med = [-1.0] * 5
+
+
+med_i = 0
+
+
+def us_once():
+    trig.value(0)
+    time.sleep_us(2)
+    trig.value(1)
+    time.sleep_us(10)
+    trig.value(0)
+    t = time_pulse_us(echo, 1, 12000)          # toi da ~2 m
+    return t * 0.0343 / 2 if t > 0 else -1.0
+
+
+def read_sensors():
+    global med_i
+    med[med_i] = us_once()
+    med_i = (med_i + 1) % 5
+    a = sorted(x for x in med if x > 0)
+    if len(a) >= 3:                             # loc trung vi 5 mau
+        r.dist = a[len(a) // 2]
+        r.noise = a[-1] - a[0]
+        r.last_valid = now()
+    elif since(r.last_valid) > C.US_LOST_MS:
+        r.dist = -1.0
+        r.noise = 0.0
+    r.water = read_water()
+    r.car = ir.value() == 0                     # FC-51: 0 = co vat can
+
+
+class Btn:
+    def __init__(self, pin):
+        self.p = Pin(pin, Pin.IN, Pin.PULL_UP)
+        self.stable = self.raw = self.p.value()
+        self.t = now()
+
+    def changed(self):                          # chong doi 30 ms
+        v = self.p.value()
+        if v != self.raw:
+            self.raw = v
+            self.t = now()
+        if self.raw != self.stable and since(self.t) > 30:
+            self.stable = self.raw
+            return True
+        return False
+
+
+sw_mode = Btn(C.PIN_SW_MODE)
+
+
+btn_open = Btn(C.PIN_BTN_OPEN)
+
+
+btn_close = Btn(C.PIN_BTN_CLOSE)
+
+
+def sw_manual():
+    return sw_mode.stable == C.SW_MANUAL_LEVEL
+
+
+def update_servo():
+    step = 15                                    # ~300 do/giay
+    if r.pos < r.tgt:
+        r.pos = min(r.tgt, r.pos + step)
+        servo_write(r.pos)
+    elif r.pos > r.tgt:
+        r.pos = max(r.tgt, r.pos - step)
+        servo_write(r.pos)
+
+
+def update_indicators():
+    ms = now()
+    g = y = rd = False
+    bz = r.buz and (ms // 80) % 2 == 1
+    if r.test == 0:
+        g = y = rd = True
+        bz = False
+    elif r.test == 1:
+        bz = True
+    elif not r.auto and not C.MANUAL_ALARMS:
+        bz = False
+    elif r.state == ST_SAFE:
+        g = True
+    elif r.state == ST_WARN:
+        y = (ms // 500) % 2 == 1                 # vang nhay 500 ms
+    elif r.state == ST_DEEP:
+        rd = (ms // 150) % 2 == 1                # do nhay 150 ms
+    else:
+        rd = True                                # nuoc rut: do sang dung
+    led_g.value(g)
+    led_y.value(y)
+    led_r.value(rd)
+    buzzer.value(bz)
+
+#==============================================================================
+# FILE: logic.py  –  Thuật toán chống ngập, dự báo, chẩn đoán
+#==============================================================================
+# logic.py - thuat toan chong ngap: chan doan, du bao, trang thai, tu kiem tra, LCD
+import time
+import config as C
+from state import *
+from hw import *
+
+
+LOOP_MS = 50
+
+
+MIS_TICKS = C.MISMATCH_SEC * 1000 // LOOP_MS
+
+
+def update_diag():
+    b = 0
+    if r.dist < 0 and since(r.last_valid) > C.US_LOST_MS:   # chi bao khi that su mat echo > 3 s
+        b |= 1
+    noisy = r.noise > (C.NOISE_OFF_CM if r.diag & 2 else C.NOISE_ON_CM)
+    if r.dist > 0 and noisy:
+        b |= 2
+    r.misA = r.misA + 1 if (r.water >= cfg["water"] and r.dist > 0 and depth() < 0.5) else 0
+    r.misB = r.misB + 1 if (r.dist > 0 and r.dist < cfg["deep"] and r.water < C.DRY_FLOOR_ADC) else 0
+    if r.misA > MIS_TICKS:
+        b |= 4
+    if r.misB > MIS_TICKS:
+        b |= 8
+    on, off = b & ~r.diag, r.diag & ~b
+    if on & 1:
+        event("Mất tín hiệu cảm biến siêu âm HY-SRF05, chuyển sang mức cảnh báo", 2)
+    if off & 1:
+        event("Cảm biến siêu âm hoạt động lại", 0)
+    if on & 2:
+        event("Siêu âm nhiễu cao, có thể mặt nước đang gợn sóng", 1)
+    if on & 4:
+        event("Lệch cảm biến: sàn ướt nhưng siêu âm báo khô", 1)
+    if on & 8:
+        event("Lệch cảm biến: siêu âm báo ngập nhưng sàn khô", 1)
+    r.diag = b
+
+
+rh = []                                         # lich su khoang cach, 1 mau/giay
+
+
+def update_rate():
+    rh.append(r.dist)
+    if len(rh) > C.RATE_WINDOW:
+        rh.pop(0)
+    pts = [(i, y) for i, y in enumerate(rh) if y > 0]
+    n = len(pts)
+    if n < 8:
+        r.rate, r.eta = 0.0, -1
+        return
+    sx = sum(p[0] for p in pts)
+    sy = sum(p[1] for p in pts)
+    sxx = sum(p[0] * p[0] for p in pts)
+    sxy = sum(p[0] * p[1] for p in pts)
+    den = n * sxx - sx * sx
+    slope = (n * sxy - sx * sy) / den if den else 0.0      # cm/giay (am = nuoc dang)
+    r.rate = -slope * 60.0
+    if r.rate >= C.RATE_MIN_CM_MIN and r.dist > cfg["deep"]:
+        r.eta = int((r.dist - cfg["deep"]) / (r.rate / 60.0))
+    else:
+        r.eta = -1
+
+
+def on_state_change(old, st):
+    if st == ST_DEEP:
+        stats["nf"] += 1
+        r.flood_start = r.last_flood = now()
+        if 0 < r.dist < cfg["deep"]:
+            event("NGẬP SÂU: mặt nước cách cảm biến %.1f cm" % r.dist, 2)
+        else:
+            event("NGẬP SÂU: cảm biến nước %d" % r.water, 2)
+    if old == ST_DEEP:
+        stats["fs"] += since(r.flood_start) // 1000
+        r.last_flood = now()
+        save_json("stats.json", stats)
+    if st == ST_WARN:
+        if r.dist > 0:
+            event("CẢNH BÁO: mặt nước %.1f cm, nguy cơ ngập" % r.dist, 1)
+        else:
+            event("CẢNH BÁO: không đo được mực nước, giữ mức an toàn", 1)
+    if st == ST_RECEDE:
+        event("Nước đã rút, cửa vẫn đóng, chờ xác nhận mở", 3)
+    if st == ST_SAFE:
+        event("Trạng thái AN TOÀN", 0)
+
+
+def update_logic():
+    deep = (0 < r.dist < cfg["deep"]) or r.water >= cfg["water"]
+    warn = (not deep) and ((0 < r.dist < cfg["warn"]) or r.water >= cfg["wwarn"]
+                           or (r.diag & 1) or (r.pre and r.eta >= 0))
+    old = r.state
+    st = ST_DEEP if deep else ST_WARN if warn else ST_RECEDE if r.latched else ST_SAFE
+    if st != old and st in (ST_DEEP, ST_SAFE):
+        r.muted = False                          # coi tu bat lai khi ngap moi / da an toan
+    r.state = st
+    if st != old:
+        on_state_change(old, st)
+
+    if r.car:
+        if not r.car_since:
+            r.car_since = now()
+        r.car_sec = since(r.car_since) // 1000
+    else:
+        r.car_since = 0
+        r.car_sec = 0
+    stuck = st == ST_DEEP and r.car_sec >= C.CAR_STUCK_SEC
+    if stuck and not r.stuck:
+        event("XE KẸT tại cửa hầm hơn 30 giây khi đang ngập sâu!", 2)
+    r.stuck = stuck
+    if st == ST_DEEP:
+        stats["mx"] = max(stats["mx"], round(depth(), 1))
+
+    if r.auto and r.test < 0:
+        if st == ST_DEEP:
+            if r.car:
+                r.tgt = C.SERVO_OPEN             # co xe: giu cua nam tren doc de xe ra
+            else:
+                r.tgt = C.SERVO_CLOSED
+                r.latched = True
+        elif st == ST_SAFE:
+            r.tgt = C.SERVO_OPEN
+        elif st == ST_RECEDE:
+            r.tgt = C.SERVO_CLOSED               # cho nguoi xac nhan
+        # dong cua som theo du bao
+        if st != ST_DEEP and not r.latched and cfg["early"] > 0 and 0 <= r.eta <= cfg["early"] and not r.car:
+            r.tgt = C.SERVO_CLOSED
+            r.latched = True
+            r.pre = True
+            stats["np"] += 1
+            save_json("stats.json", stats)
+            event("Đóng cửa sớm theo dự báo: nước dâng %.1f cm/phút, còn %d s tới ngập sâu" % (r.rate, r.eta), 1)
+
+    if r.car and r.tgt == C.SERVO_CLOSED and r.pos < C.SERVO_CLOSED - 5 and (r.auto or C.INTERLOCK_MANUAL):
+        r.tgt = C.SERVO_OPEN                     # xe xuat hien khi cua dang dung -> ha lai
+        r.blocked = True
+    else:
+        r.blocked = False
+    r.buz = st == ST_DEEP and not r.muted
+
+
+def finish_test(msg, ok):
+    r.last_test = 1 if ok else 2
+    r.test = -1
+    event(msg, 0 if ok else 2)
+
+
+def update_test():
+    if r.test < 0:
+        return
+    t = since(r.test_t0)
+    if r.state != ST_SAFE or r.car:
+        r.tgt = C.SERVO_OPEN
+        finish_test("Tự kiểm tra bị hủy: điều kiện thay đổi", False)
+        return
+    if t < 1000:
+        r.test = 0                               # bat ca 3 LED
+    elif t < 1400:
+        r.test = 1                               # thu coi
+    elif t < 3000:
+        r.test = 2
+        r.tgt = C.SERVO_CLOSED
+    elif t < 4600:
+        r.test = 3
+        r.tgt = C.SERVO_OPEN
+    else:
+        ok = r.dist > 0 and r.diag == 0 and r.pos == C.SERVO_OPEN
+        finish_test("Tự kiểm tra ĐẠT: LED, còi, servo, siêu âm" if ok
+                    else "Tự kiểm tra KHÔNG ĐẠT: kiểm tra cảm biến siêu âm", ok)
+
+
+def build_lcd():
+    d = ("%4.1f" % depth()) if r.dist > 0 else " ---"
+    r.lcd1 = "H%scm W%4d %s" % (d, r.water, "A" if r.auto else "M")
+    if r.test >= 0:
+        s2 = "TU KIEM TRA..."
+    elif r.stuck:
+        s2 = "XE KET CUA HAM!"
+    elif r.state == ST_DEEP:
+        s2 = "NGAP! CO XE-MO" if r.car else "NGAP SAU! DONG"
+    elif r.diag & 1:
+        s2 = "LOI SIEU AM!"
+    elif r.state == ST_WARN:
+        s2 = "DONG SOM-DU BAO" if r.pre else "CANH BAO:NGUY CO"
+    elif r.state == ST_RECEDE:
+        s2 = "NUOC RUT-CHO MO"
+    else:
+        s2 = "AN TOAN  CUA MO"
+    r.lcd2 = s2
+
+#==============================================================================
+# FILE: cmd.py  –  Xử lý lệnh từ HMI và nút nhấn
+#==============================================================================
+# cmd.py - lenh dieu khien: tu HMI, nut cung, hieu chuan, cau hinh
+import config as C
+from state import *
+from hw import *
+
+
+def request_close():
+    if r.car and (r.auto or C.INTERLOCK_MANUAL):
+        event("Từ chối đóng cửa: có xe tại cửa hầm", 2)
+        return False
+    r.tgt = C.SERVO_CLOSED
+    return True
+
+
+def confirm_open():
+    if r.state == ST_RECEDE:
+        r.latched = False
+        r.pre = False
+        r.tgt = C.SERVO_OPEN
+        r.state = ST_SAFE
+        event("Đã xác nhận, mở lại cửa chắn nước", 0)
+        return True
+    return False
+
+
+def start_test():
+    if r.state != ST_SAFE or r.car or r.latched:
+        event("Không thể tự kiểm tra: hệ thống phải AN TOÀN, cửa trống", 1)
+        return False
+    r.test = 0
+    r.test_t0 = now()
+    event("Bắt đầu tự kiểm tra hệ thống", 3)
+    return True
+
+
+def calibrate():
+    if r.dist > 0 and r.water < cfg["water"] and r.state == ST_SAFE:
+        cfg["dry"] = round(r.dist, 1)
+        save_json("settings.json", cfg)
+        event("Đã hiệu chuẩn mốc khô: %.1f cm" % cfg["dry"], 0)
+    else:
+        event("Không hiệu chuẩn được: cần rãnh khô và siêu âm đọc tốt", 1)
+
+
+def handle_command(c):
+    c = c.strip()
+    if c == "MODE:AUTO":
+        r.auto = True
+    elif c == "MODE:MAN":
+        r.auto = False
+    elif c == "GATE:OPEN":
+        if not r.auto:
+            r.tgt = C.SERVO_OPEN
+    elif c == "GATE:CLOSE":
+        if not r.auto:
+            request_close()
+    elif c == "MUTE:1":
+        r.muted = True
+    elif c == "MUTE:0":
+        r.muted = False
+    elif c == "CONFIRM":
+        confirm_open()
+    elif c == "TEST":
+        start_test()
+    elif c == "CAL":
+        calibrate()
+    elif c == "RSTAT":
+        stats.update({"nf": 0, "fs": 0, "mx": 0.0, "np": 0})
+        r.last_flood = 0
+        save_json("stats.json", stats)
+        event("Đã đặt lại thống kê ngập", 3)
+    elif c.startswith("CFG:"):
+        try:
+            p = c[4:].split(",")
+            d, w, x, e, dr, xw = float(p[0]), float(p[1]), int(p[2]), int(p[3]), float(p[4]), int(p[5])
+            if d > 0 and w > d and 0 <= xw < x <= 4095 and 0 <= e <= 600 and dr > w:
+                cfg.update({"deep": d, "warn": w, "water": x, "wwarn": xw, "early": e, "dry": dr})
+                save_json("settings.json", cfg)
+                event("Đã lưu cấu hình mới", 3)
+            else:
+                event("Cấu hình không hợp lệ, không lưu", 2)
+        except Exception:
+            event("Cấu hình không hợp lệ, không lưu", 2)
+
+
+def read_buttons():
+    if sw_mode.changed():
+        r.auto = not sw_manual()
+        event("Công tắc: chuyển TỰ ĐỘNG" if r.auto else "Công tắc: chuyển THỦ CÔNG", 3)
+    if btn_open.changed() and btn_open.stable == 0:
+        if r.state == ST_RECEDE:
+            confirm_open()
+        elif not r.auto:
+            r.tgt = C.SERVO_OPEN
+            event("Nút cứng: mở cửa", 3)
+        else:
+            event("Nút Mở cửa bị bỏ qua: đang ở chế độ TỰ ĐỘNG", 1)
+    if btn_close.changed() and btn_close.stable == 0:
+        if not r.auto:
+            request_close()
+            event("Nút cứng: đóng cửa", 3)
+        else:
+            event("Nút Đóng cửa bị bỏ qua: đang ở chế độ TỰ ĐỘNG", 1)
+
+#==============================================================================
+# FILE: web.py  –  Web server cho giao diện HMI
+#==============================================================================
+# web.py - web server HMI: trang hmi.html, /api/state, /api/cmd
+import json, gc, time
+import config as C
+from net import sta, ap
+from state import *
+from hw import *
+from logic import *
+from cmd import *
+
+
+def state_dict():
+    connected = sta.isconnected()
+    try:
+        rssi = sta.status("rssi") if connected else None
+    except Exception:
+        rssi = None
+    return {
+        "d": round(r.dist, 2), "w": r.water, "car": int(r.car), "ang": r.pos, "tgt": r.tgt,
+        "auto": int(r.auto), "st": r.state, "buz": int(r.buz), "mute": int(r.muted),
+        "latch": int(r.latched), "blk": int(r.blocked), "l1": r.lcd1, "l2": r.lcd2,
+        "td": cfg["deep"], "tw": cfg["warn"], "tx": cfg["water"], "txw": cfg["wwarn"],
+        "up": now() // 1000, "rssi": rssi,
+        "ip": sta.ifconfig()[0] if connected else (ap.ifconfig()[0] if getattr(C, "ENABLE_AP", False) else "-"),
+        "sw": int(sw_manual()), "bo": int(btn_open.stable == 0), "bc": int(btn_close.stable == 0),
+        "dry": cfg["dry"], "rate": round(r.rate, 2), "eta": r.eta, "early": cfg["early"], "pre": int(r.pre),
+        "diag": r.diag, "nz": round(r.noise, 2), "carT": r.car_sec, "stuck": int(r.stuck),
+        "nf": stats["nf"], "fs": stats["fs"], "mx": stats["mx"],
+        "la": since(r.last_flood) // 1000 if r.last_flood else -1, "np": stats["np"],
+        "test": r.test, "lt": r.last_test,
+        "sc": C.SERVO_CLOSED,
+    }
+
+
+def unquote(s):
+    s = s.replace("+", " ")
+    out = bytearray()
+    i = 0
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s) + 1:
+            try:
+                out.append(int(s[i + 1:i + 3], 16))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out += s[i].encode()
+        i += 1
+    return out.decode()
+
+
+def query(path):
+    q = {}
+    if "?" in path:
+        for kv in path.split("?", 1)[1].split("&"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                q[k] = unquote(v)
+    return q
+
+
+async def send_resp(w, code, ctype, body):
+    if isinstance(body, str):
+        body = body.encode()
+    w.write((("HTTP/1.1 %d OK\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+             "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n")
+            % (code, ctype, len(body))).encode())
+    w.write(body)
+    await w.drain()
+
+
+async def send_page(w):
+    import os
+    size = os.stat("hmi.html")[6]
+    w.write(("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n" % size).encode())
+    await w.drain()
+    with open("hmi.html", "rb") as f:          # gui tung khuc 1 KB, khong nap ca file vao RAM
+        while True:
+            chunk = f.read(1024)
+            if not chunk:
+                break
+            w.write(chunk)
+            await w.drain()
+
+
+async def http_handler(reader, writer):
+    try:
+        line = await reader.readline()
+        if line:
+            parts = line.decode().split(" ")
+            path = parts[1] if len(parts) > 1 else "/"
+            while True:                         # bo qua header
+                h = await reader.readline()
+                if not h or h == b"\r\n":
+                    break
+            if path.startswith("/api/state"):
+                q = query(path)
+                after = int(q.get("ev", "0") or 0)
+                t = now()
+                evs = [{"id": i, "m": m, "lv": lv, "ago": time.ticks_diff(t, ts) // 1000}
+                       for (i, m, lv, ts) in events if i > after]
+                await send_resp(writer, 200, "application/json",
+                                json.dumps({"boot": BOOT_ID, "s": state_dict(), "ev": evs}))
+            elif path.startswith("/api/cmd"):
+                handle_command(query(path).get("c", ""))
+                await send_resp(writer, 200, "text/plain", "OK")
+            elif path == "/" or path.startswith("/?") or path.startswith("/index"):
+                await send_page(writer)
+            else:
+                writer.write(b"HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+    except Exception as e:
+        print("HTTP loi:", e)
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        gc.collect()
+
+#==============================================================================
+# FILE: app.py  –  Vòng lặp chính (asyncio)
+#==============================================================================
+# app.py - vong lap dieu khien, giu Wi-Fi, khoi chay toan bo he thong
+import gc, time
+try:
+    import asyncio
+except ImportError:
+    import uasyncio as asyncio
+import config as C
+import net
+from net import sta
+from state import *
+import hw
+from hw import *
+from logic import *
+from cmd import *
+from web import *
+
+
+async def wifi_keeper():
+    was = sta.isconnected()
+    while True:
+        await asyncio.sleep(15)
+        now_conn = sta.isconnected()
+        if now_conn and not was:
+            print("Da ket noi lai Wi-Fi:", sta.ifconfig()[0])
+            event("Đã kết nối lại Wi-Fi, HMI: http://" + sta.ifconfig()[0], 0)
+        was = now_conn
+        if C.WIFI_LIST and not now_conn:
+            net.wifi_idx = (net.wifi_idx + 1) % len(C.WIFI_LIST)
+            ssid, pw = C.WIFI_LIST[net.wifi_idx]
+            print("Thu ket noi lai Wi-Fi:", ssid)
+            try:
+                sta.disconnect()
+                sta.connect(ssid, pw)
+            except Exception as e:
+                print("Loi ket noi:", e)
+
+
+async def control_loop():
+    t_rate = t_lcd = now()
+    r.last_valid = now()                        # tranh bao nham mat sieu am ngay khi khoi dong
+    while True:
+        try:
+            read_sensors()
+            read_buttons()
+            update_diag()
+            update_logic()
+            update_test()
+            build_lcd()
+            update_servo()
+            update_indicators()
+            if since(t_rate) >= 1000:
+                t_rate = now()
+                update_rate()
+            if since(t_lcd) >= 500:
+                t_lcd = now()
+                lcd_line(0, r.lcd1)
+                lcd_line(1, r.lcd2)
+        except Exception as e:
+            print("Loi vong lap:", e)
+        await asyncio.sleep_ms(LOOP_MS)
+
+
+async def run():
+    await asyncio.start_server(http_handler, "0.0.0.0", 80)
+    asyncio.create_task(wifi_keeper())
+    asyncio.create_task(control_loop())
+    while True:
+        await asyncio.sleep(3600)
+
+
+def start(l=None):
+    hw.lcd = l
+    load_json("settings.json", cfg)
+    load_json("stats.json", stats)
+    servo_write(C.SERVO_OPEN)
+    r.auto = not sw_manual()                    # khoi dong theo vi tri cong tac
+    event("ESP32 khởi động", 3)
+    time.sleep_ms(2000)                         # de kip doc IP tren LCD
+    if hw.lcd:
+        hw.lcd.clear()
+    gc.collect()
+    print("RAM trong khi chay:", gc.mem_free())
+    asyncio.run(run())
+
+#==============================================================================
+# FILE: lcd_i2c.py  –  Driver LCD 16x2 I2C
+#==============================================================================
+# lcd_i2c.py - Driver LCD 16x2 qua module I2C PCF8574 (MicroPython)
+# Mapping chuan: P0=RS, P1=RW, P2=E, P3=den nen, P4..P7=D4..D7
+import time
+
+class LCD:
+    def __init__(self, i2c, addr=0x27, cols=16, rows=2):
+        self.i2c = i2c
+        self.addr = addr
+        self.cols = cols
+        self.rows = rows
+        self.bl = 0x08
+        time.sleep_ms(50)
+        for _ in range(3):                 # dua LCD ve che do 8 bit roi chuyen 4 bit
+            self._nibble(0x30, 0)
+            time.sleep_ms(5)
+        self._nibble(0x20, 0)
+        time.sleep_ms(1)
+        self.cmd(0x28)                     # 4 bit, 2 dong, font 5x8
+        self.cmd(0x0C)                     # bat hien thi, tat con tro
+        self.cmd(0x06)                     # tu tang dia chi
+        self.clear()
+
+    def _nibble(self, val, rs):
+        b = (val & 0xF0) | rs | self.bl
+        self.i2c.writeto(self.addr, bytes([b | 0x04, b]))   # xung E
+
+    def _bytes(self, val, rs):
+        hi = (val & 0xF0) | rs | self.bl
+        lo = ((val << 4) & 0xF0) | rs | self.bl
+        return bytes([hi | 0x04, hi, lo | 0x04, lo])
+
+    def cmd(self, c):
+        self.i2c.writeto(self.addr, self._bytes(c, 0))
+        if c <= 3:
+            time.sleep_ms(2)
+
+    def clear(self):
+        self.cmd(0x01)
+
+    def move(self, col, row):
+        self.cmd(0x80 | (col + (0x40 if row else 0)))
+
+    def print(self, s):
+        buf = bytearray()
+        for ch in s:
+            o = ord(ch)
+            buf += self._bytes(o if o < 128 else 0x3F, 1)   # ky tu co dau -> '?'
+        self.i2c.writeto(self.addr, buf)
+
+    def line(self, row, s):
+        self.move(0, row)
+        self.print((s + " " * self.cols)[:self.cols])
